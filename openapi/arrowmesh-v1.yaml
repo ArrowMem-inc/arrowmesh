@@ -1,0 +1,720 @@
+openapi: 3.1.0
+info:
+  title: Arrowmesh loopback API
+  version: 1.3.0
+  summary: The local daemon API a desktop UI or a device maker codes against.
+  description: |
+    Version 1 is frozen. Changes inside /v1 are additive only (new routes, new optional request
+    fields, new response fields); a client must ignore response fields it does not know. Anything
+    that breaks a v1 client is /v2.
+
+    Every request needs BOTH of these, checked in this order:
+    1. A Host header that is an IP literal (optionally with a port) which is loopback or equal to
+       the daemon's bind address. Any name, localhost included, a missing Host or a repeated Host
+       is refused with 403 and an EMPTY body, before the token is looked at.
+    2. Authorization: Bearer <token>, the contents of the mode 600 api-token file `arrowmesh
+       install` writes. A missing or wrong token is 401 {"error":"unauthorized"}. A repeated
+       Authorization header counts as absent.
+
+    Error shape: every error is JSON {"error": "<short text>"}. Two exceptions: the Host refusal
+    (403, empty body) and a gate refusal (403, see GateBlock). A client tells them apart by body:
+    empty means Host, "blocked":true means the leak gate.
+
+    Request bodies are capped at 1 MiB (413). The daemon logs no request body, no passphrase and
+    no message text.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+servers:
+  - url: http://127.0.0.1:8088
+    description: Default bind. The port is the chat_addr setting.
+security:
+  - bearerToken: []
+paths:
+  /v1/openapi.yaml:
+    get:
+      operationId: getOpenapi
+      summary: This document.
+      responses:
+        "200":
+          description: The OpenAPI 3.1 document.
+          content:
+            application/yaml:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/HostRefused" }
+  /v1/status:
+    get:
+      operationId: getStatus
+      summary: Counts and yes/no only. No names, no content.
+      responses:
+        "200":
+          description: Daemon status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Status" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/HostRefused" }
+  /v1/install:
+    get:
+      operationId: getInstall
+      summary: Whether the install artefacts exist. Booleans and one count; no paths.
+      description: Installing (writing the identity key) needs the passphrase and stays a command line step, `arrowmesh install`.
+      responses:
+        "200":
+          description: Install state.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InstallState" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/HostRefused" }
+  /v1/chat:
+    post:
+      operationId: postChat
+      summary: Chat with the local model. The prompt is gated before the model, the reply before you.
+      description: |
+        Nothing is sent to the model when the prompt is refused. A refused reply is never delivered.
+        By default the leak gate sees the whole reply before any of it is shown. Send `"async": true`
+        to get 202 and a job id instead of holding the connection, then poll GET /v1/chat/jobs/{id}.
+
+        Added in 1.2: send `"stream": true` AND the header `Accept: text/event-stream` to receive the
+        reply as server sent events (`text/event-stream`, chunked) while it is generated. Both are
+        required: `"stream": true` without that Accept header is the 1.1 request and gets the one
+        JSON answer (and `async` works with it). `stream` must be a boolean whatever the header says
+        (400 otherwise); `stream` with `async` and the header is 400. Every refusal that can happen before the model answers (423 sealed
+        vault, 400, 403 prompt gate, 413, 429, 502) is an ordinary JSON answer with that status and
+        no event. Otherwise the answer is 200 and a sequence of events (see StreamEvent): zero or
+        more `delta` (released reply text, in order) and `held` (a count of characters held back,
+        never their content), then exactly ONE terminal event: `done` (the full ChatReply),
+        `blocked` (GateBlock) or `error`. A client that sees the connection end with no terminal
+        event treats it as `error`. On `blocked` or `error` the client must discard everything it
+        showed: the reply is withheld whole, and nothing was written to the vault. Nothing is
+        written to the vault before `done`. Released text is a prefix that passed the rules scan,
+        cut at Unicode whitespace and kept a window of 64 characters behind the newest text; the
+        model layer, when on, runs once on the whole reply before `done`. Text that only the whole
+        reply reveals can be shown and then withdrawn by `blocked`. Once the reply so far holds
+        anything the gate decodes (`&#`, a percent escape, a backslash u or x escape, `xn--`, a run
+        of 16 or more base64 characters), nothing more is released until the whole reply has been
+        checked. The vault lock is checked immediately before every `delta`. At most two streams
+        run at once (a third is 429); a stream's place is held until its response has ended, and a
+        response write that makes no progress for 10 seconds ends it. Comment lines (starting with a colon) are keepalives and carry nothing.
+        A peer never receives a stream: send the finished text through POST /v1/send, which gates
+        it again as a whole. Streaming is unavailable (a streaming request is 400, `streaming` is false
+        in the status) while a configured blocklist line is longer than the hold window or the
+        blocklist cannot be read.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ChatRequest" }
+      responses:
+        "200":
+          description: Gated reply, stored in the vault.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChatReply" }
+            text/event-stream:
+              description: "With stream true and Accept text/event-stream. Events named delta, held, blocked, done or error; each has an id (counting up from 1) and one data line holding one JSON object. After an error event the vault history is the truth for what was stored: the exchange may be stored while the client saw error."
+              schema: { $ref: "#/components/schemas/StreamEvent" }
+        "202":
+          description: Accepted as a background job (async true).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JobAccepted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/GateOrHost" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/Busy" }
+        "502": { $ref: "#/components/responses/ModelDown" }
+        "423": { $ref: "#/components/responses/Locked" }
+        "503": { $ref: "#/components/responses/VaultWrite" }
+  /v1/chat/jobs/{id}:
+    get:
+      operationId: getChatJob
+      summary: Poll an async chat. A finished job is returned once, then forgotten.
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: Running, or done with the original status and body.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JobState" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/HostRefused" }
+        "404": { $ref: "#/components/responses/UnknownId" }
+        "423": { $ref: "#/components/responses/Locked" }
+  /v1/gate/check:
+    post:
+      operationId: postGateCheck
+      summary: Ask the leak gate about a text without sending it anywhere. Nothing is stored.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text: { type: string }
+      responses:
+        "200":
+          description: Verdict. Category names only, never the matched text.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GateVerdict" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/HostRefused" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+  /v1/history:
+    get:
+      operationId: getHistory
+      summary: One conversation, decrypted, oldest first.
+      parameters:
+        - name: conv
+          in: query
+          required: false
+          description: Conversation name, 1 to 32 of letters, digits, hyphen, underscore. Default is "default".
+          schema: { type: string, pattern: "^[A-Za-z0-9_-]{1,32}$" }
+      responses:
+        "200":
+          description: Entries.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/History" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/HostRefused" }
+        "500": { $ref: "#/components/responses/VaultRead" }
+        "423": { $ref: "#/components/responses/Locked" }
+  /v1/vault/unlock:
+    post:
+      operationId: postVaultUnlock
+      summary: Unlock the vault with the passphrase, or re-check it when already unlocked.
+      description: |
+        Added in 1.1. The daemon boots locked: no passphrase is read from the environment, a file or
+        the command line. While locked, chat, send, history, the conversation list and the sealed
+        export answer 423 {"error":"vault locked"}, and this route unwraps the identity key and opens
+        the vault. When already unlocked it only re-checks the passphrase and changes nothing. The
+        passphrase travels in the body over loopback only and is never logged or echoed. Every
+        attempt, right or wrong, is counted in a 30 second window that opens at the first counted
+        attempt; the sixth inside the window is refused (429) until it ends, locked or not; a right
+        passphrase resets the count. 503 here means the key unwrapped but this vault was not sealed
+        by it; the vault stays sealed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [passphrase]
+              properties:
+                passphrase: { type: string, minLength: 1, writeOnly: true }
+      responses:
+        "200":
+          description: Passphrase correct.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [unlocked]
+                properties:
+                  unlocked: { type: boolean, const: true }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401":
+          description: Wrong token (error "unauthorized") or wrong passphrase (error "wrong passphrase").
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403": { $ref: "#/components/responses/HostRefused" }
+        "429":
+          description: Too many wrong attempts.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, retry_after]
+                properties:
+                  error: { type: string }
+                  retry_after: { type: integer, description: Seconds. }
+        "503": { $ref: "#/components/responses/KeyMismatch" }
+  /v1/vault/lock:
+    post:
+      operationId: postVaultLock
+      summary: Lock the vault again.
+      description: |
+        Added in 1.1. Drops the unwrapped identity key from the daemon. Afterwards the vault routes
+        answer 423 {"error":"vault locked"} until the next unlock, and the mesh listener closes
+        incoming connections unanswered, so a peer's send fails while locked. A request already
+        running when this is called is discarded: it writes no record, and every chat job is forgotten.
+        Idempotent.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: The vault is locked.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [locked]
+                properties:
+                  locked: { type: boolean, const: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/HostRefused" }
+  /v1/vault/conversations:
+    get:
+      operationId: getVaultConversations
+      summary: Conversation names with message counts.
+      responses:
+        "200":
+          description: Conversations in order of first appearance.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [conversations]
+                properties:
+                  conversations:
+                    type: array
+                    items: { $ref: "#/components/schemas/ConversationSummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/HostRefused" }
+        "500": { $ref: "#/components/responses/VaultRead" }
+        "423": { $ref: "#/components/responses/Locked" }
+  /v1/vault/export:
+    get:
+      operationId: getVaultExport
+      summary: The sealed export. The vault's own ciphertext objects, hex, in record order.
+      description: No plaintext leaves in this route. Only the holder of the identity key can open the objects. Paged; pass `next` as `from` for the following page.
+      parameters:
+        - name: from
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, default: 1 }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 1000 }
+      responses:
+        "200":
+          description: One page.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SealedExport" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/HostRefused" }
+        "500": { $ref: "#/components/responses/VaultRead" }
+        "423": { $ref: "#/components/responses/Locked" }
+  /v1/peers:
+    get:
+      operationId: getPeers
+      summary: Configured peers (public keys only), and peers added but not yet active.
+      parameters:
+        - name: probe
+          in: query
+          required: false
+          description: "1 opens a TCP connection to each active peer and adds `reachable`. Sends nothing."
+          schema: { type: string, enum: ["1"] }
+      responses:
+        "200":
+          description: Peers.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [peers]
+                properties:
+                  peers:
+                    type: array
+                    items: { $ref: "#/components/schemas/Peer" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/HostRefused" }
+    post:
+      operationId: postPeers
+      summary: Add a peer by pasted keys.
+      description: |
+        The mesh holds the peer list read at start, so the new peer is saved beside the identity key
+        and becomes active at the next daemon restart (restart_required true, active false).
+        Addresses must be IP literals: loopback or private ranges.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PeerAdd" }
+      responses:
+        "202":
+          description: Saved; active after restart.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [added, name, active, restart_required]
+                properties:
+                  added: { type: boolean }
+                  name: { type: string }
+                  active: { type: boolean, const: false }
+                  restart_required: { type: boolean, const: true }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/HostRefused" }
+        "409":
+          description: A peer with that name exists.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          description: Could not save.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /v1/send:
+    post:
+      operationId: postSend
+      summary: Send one sealed message to a peer. The text is gated first.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [peer, text]
+              properties:
+                peer: { type: string }
+                text: { type: string, description: At most one sealed object body (885 bytes). }
+      responses:
+        "200":
+          description: The peer acknowledged the sealed object.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SendResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/GateOrHost" }
+        "404":
+          description: Unknown peer.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "502":
+          description: The peer did not accept it. Carries send_id and error.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SendFailed" }
+        "423": { $ref: "#/components/responses/Locked" }
+        "503": { $ref: "#/components/responses/VaultWrite" }
+  /v1/sends:
+    get:
+      operationId: getSends
+      summary: Recent send attempts, newest first (metadata only, last 256, lost on restart).
+      responses:
+        "200":
+          description: Send records.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sends]
+                properties:
+                  sends:
+                    type: array
+                    items: { $ref: "#/components/schemas/SendRecord" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/HostRefused" }
+  /v1/sends/{id}:
+    get:
+      operationId: getSend
+      summary: Delivery status of one send.
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: The record.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SendRecord" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/HostRefused" }
+        "404": { $ref: "#/components/responses/UnknownId" }
+components:
+  securitySchemes:
+    bearerToken:
+      type: http
+      scheme: bearer
+      description: |
+        The 64 hex character token in the mode 600 api-token file. Also required, and checked
+        first: a Host header that is an IP literal, loopback or the bind address. See the
+        description of this document.
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
+  responses:
+    Unauthorized:
+      description: Missing or wrong bearer token.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    HostRefused:
+      description: Host header is not an IP literal that is loopback or the bind address. Empty body.
+    GateOrHost:
+      description: The leak gate refused (JSON GateBlock), or the Host rule refused (empty body).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/GateBlock" }
+    BadRequest:
+      description: Malformed request.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    TooLarge:
+      description: Body over 1 MiB, or a message longer than one sealed object.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Busy:
+      description: Too many chats running.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ModelDown:
+      description: The local model is unavailable or gave a bad reply.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    VaultWrite:
+      description: The vault write failed and the reply was withheld, or a send was refused by the vault. (A sealed vault is 423.)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    VaultRead:
+      description: The vault failed its integrity check or could not be read.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    KeyMismatch:
+      description: The key unwrapped but this vault was not sealed by it. The body never contains the word lock.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Locked:
+      description: The vault is sealed (error "vault locked"). Send the passphrase to POST /v1/vault/unlock first. 423 means sealed and nothing else.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    UnknownId:
+      description: No such id.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+    GateBlock:
+      type: object
+      required: [blocked, stage, categories]
+      properties:
+        blocked: { type: boolean, const: true }
+        stage:
+          type: string
+          enum: [prompt, reply, text]
+          description: prompt and reply for chat, text for send.
+        categories:
+          type: array
+          description: Category names such as personal:email. Never the matched text.
+          items: { type: string }
+    GateVerdict:
+      type: object
+      required: [verdict, categories]
+      properties:
+        verdict: { type: string, enum: [pass, block] }
+        categories:
+          type: array
+          items: { type: string }
+    Message:
+      type: object
+      required: [role, content]
+      properties:
+        role: { type: string, enum: [system, user, assistant] }
+        content: { type: string }
+    ChatRequest:
+      type: object
+      required: [messages]
+      properties:
+        conv: { type: string, pattern: "^[A-Za-z0-9_-]{1,32}$", default: default }
+        messages:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/Message" }
+        async: { type: boolean, default: false }
+        stream: { type: boolean, default: false, description: "Added in 1.2. With the header Accept text/event-stream, receive the reply as server sent events. Without that header stream true is ignored, as in 1.1. Not with async when both are sent (400). Must be a boolean." }
+    StreamEvent:
+      description: |
+        The data of one server sent event. The event name says which. Exactly one of done, blocked
+        and error ends a stream; delta and held may repeat before it.
+      oneOf:
+        - type: object
+          title: delta
+          required: [text]
+          properties:
+            text: { type: string, description: Released reply text. Concatenate the deltas in order. }
+        - type: object
+          title: held
+          required: [chars]
+          properties:
+            chars: { type: integer, description: Characters currently held back. A count only, never content. }
+        - { $ref: "#/components/schemas/GateBlock" }
+        - { $ref: "#/components/schemas/ChatReply" }
+        - { $ref: "#/components/schemas/Error" }
+    ChatReply:
+      type: object
+      required: [conv, choices, gate]
+      properties:
+        conv: { type: string }
+        choices:
+          type: array
+          items:
+            type: object
+            required: [message]
+            properties:
+              message: { $ref: "#/components/schemas/Message" }
+        gate:
+          type: object
+          description: Both gate checks passed, otherwise there is no reply.
+          required: [prompt, reply]
+          properties:
+            prompt: { type: string, const: pass }
+            reply: { type: string, const: pass }
+    JobAccepted:
+      type: object
+      required: [job]
+      properties:
+        job: { type: integer }
+    JobState:
+      type: object
+      required: [state]
+      properties:
+        state: { type: string, enum: [running, done] }
+        status: { type: integer, description: The HTTP status the chat would have returned. Present when done. }
+        result:
+          description: The body the chat would have returned (ChatReply, GateBlock or Error). Present when done.
+    History:
+      type: object
+      required: [conv, entries]
+      properties:
+        conv: { type: string }
+        entries:
+          type: array
+          items:
+            type: object
+            required: [id, kind, text]
+            properties:
+              id: { type: integer }
+              kind: { type: string, enum: [user, assistant, peer_in, peer_out] }
+              text: { type: string }
+    ConversationSummary:
+      type: object
+      required: [name, messages, last_msg_id]
+      properties:
+        name: { type: string }
+        messages: { type: integer }
+        last_msg_id: { type: integer }
+    SealedExport:
+      type: object
+      required: [format, total, records, next]
+      properties:
+        format: { type: string, const: arrowmesh-sealed-v1 }
+        total: { type: integer, description: Records in the vault. }
+        records:
+          type: array
+          items:
+            type: object
+            required: [n, object]
+            properties:
+              n: { type: integer }
+              object: { type: string, description: Hex of one sealed object. }
+        next:
+          type: [integer, "null"]
+          description: Pass as `from` for the next page; null on the last page.
+        head:
+          type: [string, "null"]
+          description: Optional. Hex of the sealed head record (the vault `head` file). Present only on the last page (`next` null); null there if the vault has no head yet. Needed to restore; see API.md.
+    Peer:
+      type: object
+      required: [name, addr, sign_pub, seal_pub, active]
+      properties:
+        name: { type: string }
+        addr: { type: string }
+        sign_pub: { type: string, description: 33 bytes, hex. }
+        seal_pub: { type: string, description: 65 bytes, hex. }
+        active: { type: boolean }
+        reachable: { type: boolean, description: Only with probe=1 and only for active peers. }
+    PeerAdd:
+      type: object
+      required: [name, addr, sign_pub, seal_pub]
+      properties:
+        name: { type: string, pattern: "^[A-Za-z0-9_-]{1,32}$" }
+        addr: { type: string, description: "IP literal and port, loopback or private range, for example 192.168.1.20:8090." }
+        sign_pub: { type: string, description: 33 bytes, hex, from `arrowmesh pubkeys`. }
+        seal_pub: { type: string, description: 65 bytes, hex, from `arrowmesh pubkeys`. }
+    SendResult:
+      type: object
+      required: [sent, send_id, state]
+      properties:
+        sent: { type: boolean }
+        send_id: { type: integer }
+        state: { type: string, const: delivered }
+    SendFailed:
+      type: object
+      required: [error, send_id]
+      properties:
+        error: { type: string }
+        send_id: { type: integer }
+    SendRecord:
+      type: object
+      required: [id, peer, state, categories, reason]
+      properties:
+        id: { type: integer }
+        peer: { type: string }
+        state: { type: string, enum: [delivered, failed, blocked] }
+        categories:
+          type: array
+          items: { type: string }
+        reason:
+          type: [string, "null"]
+    Status:
+      type: object
+      required: [api, model_up, gate_up, vault_unlocked, vault_records, peers_total, peers_reachable]
+      properties:
+        api: { type: string, const: v1 }
+        model_up: { type: boolean }
+        gate_up: { type: boolean }
+        vault_unlocked: { type: boolean, description: "False while the daemon is locked (the boot state since 1.1)." }
+        vault_records: { type: integer }
+        peers_total: { type: integer }
+        peers_reachable: { type: integer }
+        streaming: { type: boolean, description: "Added in 1.2. True when POST /v1/chat streams for stream true with Accept text/event-stream; false while a blocklist line is longer than the hold window or the blocklist cannot be read." }
+        model_keyed: { type: boolean, description: "Added in 1.3. True when a bearer key is being sent on upstream model calls. A boolean only; the key is never shown." }
+        messages_received: { type: integer, description: "Added in 1.2. Peer messages this daemon accepted into the vault since it started. In memory, a count only, zero after a restart." }
+        gate_verdicts: { type: integer, description: "Added in 1.2. Whole text verdicts the gate has given since this daemon started (chat prompt, chat reply, send, gate check), pass or block. In memory, a count only, zero after a restart. Prefix scans of a streamed reply are not counted." }
+    InstallState:
+      type: object
+      required: [key_present, token_present, vault_present, model_configured, peers_configured]
+      properties:
+        key_present: { type: boolean }
+        token_present: { type: boolean }
+        vault_present: { type: boolean }
+        model_configured: { type: boolean }
+        peers_configured: { type: integer }
